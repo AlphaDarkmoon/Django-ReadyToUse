@@ -11,9 +11,9 @@ from django.contrib.auth.tokens import default_token_generator
 from django.contrib.auth import authenticate, login
 from django.urls import reverse, reverse_lazy
 from django.contrib.auth.forms import PasswordResetForm, SetPasswordForm
-from django.contrib.auth.views import PasswordResetConfirmView
+from django.contrib.auth.views import PasswordResetConfirmView, PasswordResetCompleteView
 from .forms import RegistrationForm
-
+from .tasks import send_verification_email, send_password_reset_email
 
 def register_view(request):
     if request.method == 'POST':
@@ -21,9 +21,6 @@ def register_view(request):
         email = request.POST.get('email')
         password1 = request.POST.get('password1')
         password2 = request.POST.get('password2')
-
-        # Print values to console
-        print(f"Registering User: Username: {username}, Email: {email}, Password: {password1}")
 
         if password1 == password2:
             if User.objects.filter(username=username).exists():
@@ -35,10 +32,11 @@ def register_view(request):
                 user.is_active = False  # Deactivate account until email verification
                 user.save()
 
-                # Send verification email
+                # Generate token and UID
                 token = default_token_generator.make_token(user)
                 uid = urlsafe_base64_encode(force_bytes(user.pk))
 
+                # Prepare email content
                 mail_subject = 'Activate your account'
                 html_message = render_to_string('AuthSys/activation_email.html', {
                     'user': user,
@@ -46,22 +44,15 @@ def register_view(request):
                     'token': token,
                     'domain': request.get_host(),
                 })
-                plain_message = strip_tags(html_message)
 
-                send_mail(
-                    mail_subject,
-                    plain_message,
-                    settings.EMAIL_HOST_USER,
-                    [user.email],
-                    html_message=html_message
-                )
+                # Send email asynchronously
+                send_verification_email.delay(mail_subject, html_message, [user.email])
 
                 messages.success(request, 'Please check your email to activate your account.')
                 return redirect('AuthSys:login')
         else:
             messages.error(request, 'Passwords do not match.')
     return render(request, 'AuthSys/register.html')
-
 
 def activate_view(request, uidb64, token):
     try:
@@ -106,8 +97,35 @@ class CustomPasswordResetConfirmView(PasswordResetConfirmView):
     success_url = reverse_lazy('AuthSys:password_reset_complete')  # Where to redirect after a successful reset
 
     def form_valid(self, form):
+        # Print the new password to the terminal
+        new_password = form.cleaned_data.get('password1')
+        print(f"New Password: {new_password}")
+        
         # You can add custom logic here if necessary
         return super().form_valid(form)
+
+
+class CustomPasswordResetConfirmView(PasswordResetConfirmView):
+    template_name = 'AuthSys/custom_password_reset_confirm.html'  
+    form_class = SetPasswordForm  
+    success_url = reverse_lazy('AuthSys:password_reset_complete')  
+
+    def form_valid(self, form):
+        # Log the successful validation of the form
+        print("Password reset form is valid.")
+        new_password = form.cleaned_data.get('password1')
+        print(f"New Password: {new_password}")
+        
+        return super().form_valid(form)
+
+    def form_invalid(self, form):
+        # Log any validation errors
+        print("Password reset form is invalid.")
+        new_password = form.cleaned_data.get('password1')
+        print(f"New Password: {new_password}")
+        print(form.errors)
+        return super().form_invalid(form)
+
 
 
 def forgot_password_view(request):
@@ -115,15 +133,15 @@ def forgot_password_view(request):
         email = request.POST.get('email')
         if email:
             try:
-                user = User.objects.get(email=email)  # Get the user by email
+                user = User.objects.get(email=email)
 
                 # Generate UID and token
                 uidb64 = urlsafe_base64_encode(force_bytes(user.pk))
                 token = default_token_generator.make_token(user)
 
-                # Build the password reset URL
+                # Build password reset URL
                 reset_url = request.build_absolute_uri(reverse('AuthSys:custom_password_reset_confirm', kwargs={
-                    'uidb64': uidb64,  # Make sure uidb64 and token are passed correctly
+                    'uidb64': uidb64,
                     'token': token,
                 }))
 
@@ -136,13 +154,8 @@ def forgot_password_view(request):
                     'protocol': 'https' if request.is_secure() else 'http',
                 })
 
-                send_mail(
-                    mail_subject,
-                    html_message,
-                    settings.EMAIL_HOST_USER,
-                    [user.email],
-                    html_message=html_message,
-                )
+                # Send email asynchronously
+                send_password_reset_email.delay(mail_subject, html_message, [user.email])
 
                 messages.success(request, 'Password reset email has been sent.')
                 return redirect('AuthSys:login')
@@ -152,9 +165,6 @@ def forgot_password_view(request):
             messages.error(request, 'Please enter an email address.')
     return render(request, 'AuthSys/forgot_password.html')
 
-
-from django.contrib.auth.views import PasswordResetCompleteView
-from django.urls import reverse_lazy
 
 class CustomPasswordResetCompleteView(PasswordResetCompleteView):
     template_name = 'AuthSys/password_reset_mail_send.html'
